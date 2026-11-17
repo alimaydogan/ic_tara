@@ -1,0 +1,690 @@
+#!/usr/bin/env bash
+#
+# ictara.sh - Ic Ag Recon / Tarama Araci
+# -------------------------------------------------------------------
+# tara.sh'in ic-ag kardesi. Nexpose/Nessus olmadan, sadece nmap + NSE
+# ile ic agda en sik karsilasilan bulgulari adim adim toplar.
+#
+# Mantik:
+#   1. Verilen blok/subnet icinde CANLI host'lari bul (host discovery)
+#   2. Canli host'larda acik TCP portlarini cikar
+#   3. Ic aga ozgu kontrolleri calistir (OS, SMB1, SNMP, Telnet, CIFS, ...)
+#   4. Her bulguyu ayri dosyaya + okunabilir OZET raporuna yaz
+#
+# Iki calisma modu:
+#   - INTERAKTIF (default): menu cikar, her adimi sen secip baslatirsin
+#   - AUTO (--auto): tum adimlari sirayla, yavas yavas kendisi calistirir
+#
+# ONEMLI: Bu arac sadece YETKILI oldugun aglarda (kendi engagement'larinda,
+# yazili izinle) kullanilmak icindir.
+#
+# Kullanim:
+#   sudo ./ictara.sh                      -> interaktif, subnet'i sorar
+#   sudo ./ictara.sh -t 10.0.0.0/24       -> hedef verip menu acar
+#   sudo ./ictara.sh -t 10.0.0.0/24 --auto
+#   sudo ./ictara.sh -l hedefler.txt --auto
+#   sudo ./ictara.sh --help
+# -------------------------------------------------------------------
+
+set -o pipefail
+
+# ----------------------- Renkler -----------------------
+if [[ -t 1 ]]; then
+    C_RST='\033[0m'; C_R='\033[1;31m'; C_G='\033[1;32m'
+    C_Y='\033[1;33m'; C_B='\033[1;34m'; C_C='\033[1;36m'; C_DIM='\033[2m'
+else
+    C_RST=''; C_R=''; C_G=''; C_Y=''; C_B=''; C_C=''; C_DIM=''
+fi
+
+# ----------------------- Global degiskenler -----------------------
+TARGET=""              # subnet veya tek IP (-t)
+TARGET_LIST=""         # hedef dosyasi (-l)
+AUTO=0                 # otomatik mod
+PING_SCAN=0            # -Pn kapat (ping ile host discovery) -> default -Pn acik
+OUTDIR=""
+LIVE_HOSTS=""          # canli host dosyasi (nmap -iL icin)
+SUMMARY=""             # ozet rapor dosyasi
+TOP_PORTS="--top-ports 1000"
+SCRIPT_NAME="$(basename "$0")"
+
+# ----------------------- Yardimci fonksiyonlar -----------------------
+banner() {
+    echo -e "${C_C}"
+    cat <<'EOF'
+   _      _
+  (_)    | |
+   _  ___| |_ __ _ _ __ __ _
+  | |/ __| __/ _` | '__/ _` |
+  | | (__| || (_| | | | (_| |
+  |_|\___|\__\__,_|_|  \__,_|   ic-ag recon
+EOF
+    echo -e "${C_RST}${C_DIM}  sadece yetkili aglarda kullanin${C_RST}\n"
+}
+
+usage() {
+    banner
+    cat <<EOF
+Kullanim: sudo ./${SCRIPT_NAME} [secenekler]
+
+  -t, --target <IP|CIDR>   Hedef subnet veya tek IP (orn: 10.0.0.0/24)
+  -l, --list <dosya>       Satir satir hedef iceren dosya
+      --auto               Tum adimlari sirayla otomatik calistir
+      --ping               Host discovery'de ping kullan (-Pn KAPAT)
+      --top-ports <N>      nmap top-ports sayisi (default 1000)
+      --full-ports         Tum TCP portlari (-p-) - yavas
+  -o, --output <dizin>     Cikti dizini (default: ictara_<tarih>)
+  -h, --help               Bu yardimi goster
+
+Ornekler:
+  sudo ./${SCRIPT_NAME}
+  sudo ./${SCRIPT_NAME} -t 192.168.1.0/24
+  sudo ./${SCRIPT_NAME} -t 10.10.0.0/16 --auto
+  sudo ./${SCRIPT_NAME} -l hedefler.txt --auto -o musteri_x
+
+Adimlar (interaktif menude tek tek, --auto'da hepsi sirayla):
+  1) Host discovery      - blokta canli IP'leri bul
+  2) Port/servis tarama  - canli host'larda acik port + versiyon
+  3) OS tespiti          - isletim sistemi tahmini
+  4) SMB / SMBv1         - SMBv1 acik mi, signing durumu, OS bilgisi
+  5) SMB share / CIFS    - anonim erisilebilir dosya paylasimlari
+  6) SNMP                - public/private community, SNMP bilgi
+  7) Telnet / clear-text - telnet, ftp, rlogin, vnc, http-auth
+  8) Veritabani          - MSSQL/MySQL/PgSQL/Oracle/Mongo/Redis vs surum+NSE
+  9) VMware / ESXi       - aday tespiti (port+cert+http) + SOAP surum
+ 10) Hizli zafiyet NSE   - ms17-010, smb-vuln*, yaygin ic-ag check'leri
+EOF
+}
+
+die()  { echo -e "${C_R}[!] $*${C_RST}" >&2; exit 1; }
+info() { echo -e "${C_B}[*]${C_RST} $*"; }
+ok()   { echo -e "${C_G}[+]${C_RST} $*"; }
+warn() { echo -e "${C_Y}[!]${C_RST} $*"; }
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "Root gerekiyor (OS tespiti, SYN scan vs icin). 'sudo ./${SCRIPT_NAME}' ile calistir."
+    fi
+}
+
+check_deps() {
+    local missing=()
+    command -v nmap >/dev/null 2>&1 || missing+=("nmap")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Eksik arac(lar): ${missing[*]}  ->  apt install ${missing[*]}"
+    fi
+    # opsiyonel ama guzel olanlar
+    command -v nmap-converter >/dev/null 2>&1 || true
+}
+
+# netexec (nxc) ya da eski crackmapexec (cme) binary'sini bul.
+# Ikisi de yoksa bos doner -> cagiran taraf nmap'e fallback eder.
+NXC_BIN=""
+detect_nxc() {
+    if command -v nxc >/dev/null 2>&1; then
+        NXC_BIN="nxc"
+    elif command -v netexec >/dev/null 2>&1; then
+        NXC_BIN="netexec"
+    elif command -v crackmapexec >/dev/null 2>&1; then
+        NXC_BIN="crackmapexec"
+    elif command -v cme >/dev/null 2>&1; then
+        NXC_BIN="cme"
+    else
+        NXC_BIN=""
+    fi
+    echo "$NXC_BIN"
+}
+
+# Ozet raporuna bir blok ekle
+log_summary() {
+    local title="$1"; shift
+    {
+        echo ""
+        echo "==================================================================="
+        echo "  $title"
+        echo "  $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "==================================================================="
+    } >> "$SUMMARY"
+    [[ -n "$*" ]] && echo "$*" >> "$SUMMARY"
+}
+
+# nmap -iL icin hedef kaynagini dondur
+target_args() {
+    if [[ -n "$TARGET_LIST" ]]; then
+        echo "-iL $TARGET_LIST"
+    else
+        echo "$TARGET"
+    fi
+}
+
+# Canli host listesi olustu mu? (adim 1 calisti mi)
+require_live_hosts() {
+    if [[ ! -s "$LIVE_HOSTS" ]]; then
+        warn "Once Adim 1 (Host discovery) calismali - canli host listesi yok."
+        return 1
+    fi
+    return 0
+}
+
+# ----------------------- ADIMLAR -----------------------
+
+# 1) Host discovery
+step_discovery() {
+    info "Adim 1: Host discovery - canli IP'ler araniyor..."
+    local out="$OUTDIR/01_host_discovery"
+    local tgt; tgt="$(target_args)"
+
+    # -sn: port taramasiz, sadece host up mi? ARP (ayni L2) + ICMP + TCP SYN 443/80
+    # ic agda ARP cok guvenilir, firewall bunu engellemez.
+    # shellcheck disable=SC2086
+    nmap -sn -PR -PE -PS21,22,23,80,135,139,443,445,3389 -PA80,443 \
+        -n --max-retries 2 $tgt -oG "${out}.gnmap" -oN "${out}.txt" >/dev/null 2>&1
+
+    # Canli IP'leri ayikla
+    grep "Up$" "${out}.gnmap" 2>/dev/null | awk '{print $2}' | sort -V -u > "$LIVE_HOSTS"
+
+    local count; count=$(wc -l < "$LIVE_HOSTS" 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        warn "Canli host bulunamadi. Firewall ICMP/ARP'i engelliyor olabilir."
+        warn "Ipucu: '--ping' yerine default (-Pn) dene ya da subnet'i kontrol et."
+    else
+        ok "$count canli host bulundu -> $LIVE_HOSTS"
+        sed 's/^/     /' "$LIVE_HOSTS"
+    fi
+    log_summary "ADIM 1 - HOST DISCOVERY ($count canli host)" "$(cat "$LIVE_HOSTS" 2>/dev/null)"
+}
+
+# 2) Port + servis tarama
+step_ports() {
+    require_live_hosts || return
+    info "Adim 2: Port + servis tarama (canli host'larda)..."
+    local out="$OUTDIR/02_ports_services"
+    local pflag="$TOP_PORTS"
+
+    # -sS SYN scan, -sV versiyon, -Pn (zaten canli oldugunu biliyoruz)
+    # shellcheck disable=SC2086
+    nmap -sS -sV -Pn -n $pflag --open --max-retries 2 \
+        -iL "$LIVE_HOSTS" -oN "${out}.txt" -oG "${out}.gnmap" 2>/dev/null \
+        | tee "${out}.live.txt" | grep -E "Nmap scan report|open"
+
+    ok "Port/servis sonucu -> ${out}.txt"
+    log_summary "ADIM 2 - ACIK PORTLAR / SERVISLER" \
+        "$(grep -E 'Nmap scan report|/tcp ' "${out}.txt" 2>/dev/null)"
+}
+
+# 3) OS tespiti
+# Birincil: netexec/crackmapexec 'smb' -> SMB konusan (cogu Windows) host'ta
+#           OS + hostname + domain + SMBv1 + signing'i tek atista verir, hizli+dogru.
+# Fallback: nmap -O -> SMB'si olmayan host'lar (Linux, yazici, network cihazi) icin.
+step_os() {
+    require_live_hosts || return
+    info "Adim 3: OS tespiti..."
+    local out="$OUTDIR/03_os_detect"
+    local nxc; nxc="$(detect_nxc)"
+
+    if [[ -n "$nxc" ]]; then
+        ok "netexec bulundu ($nxc) - SMB host'lari icin birincil kaynak."
+        info "  -> $nxc smb (OS / hostname / domain / signing)..."
+        # -iL ile canli host listesini direkt besliyoruz.
+        # Ciktida OS satirlari zaten [*] host bilgisini tasir.
+        "$nxc" smb "$LIVE_HOSTS" 2>/dev/null | tee "${out}_nxc.txt" \
+            | grep -iE "SMB|Windows|signing|SMBv1|domain"
+
+        ok "netexec OS sonucu -> ${out}_nxc.txt"
+
+        # SMB cevabi VERMEYEN host'lari ayikla -> bunlara nmap -O at (fallback)
+        # nxc ciktisinda host up ise satir basinda IP gecer.
+        local no_smb="$OUTDIR/03_os_nmap_fallback_targets.txt"
+        grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "${out}_nxc.txt" 2>/dev/null | sort -V -u > "$OUTDIR/.smb_hosts.tmp"
+        grep -vxF -f "$OUTDIR/.smb_hosts.tmp" "$LIVE_HOSTS" 2>/dev/null > "$no_smb"
+
+        if [[ -s "$no_smb" ]]; then
+            local nc; nc=$(wc -l < "$no_smb")
+            info "  -> SMB konusmayan $nc host var, nmap -O fallback calisiyor..."
+            # shellcheck disable=SC2086
+            nmap -O -Pn -n --osscan-guess --max-retries 2 \
+                -iL "$no_smb" -oN "${out}_nmap.txt" 2>/dev/null \
+                | grep -E "Nmap scan report|Running|OS details"
+            ok "nmap fallback OS sonucu -> ${out}_nmap.txt"
+        else
+            info "  -> Tum canli host'lar SMB cevabi verdi, nmap -O'ya gerek kalmadi."
+        fi
+        rm -f "$OUTDIR/.smb_hosts.tmp"
+
+        log_summary "ADIM 3 - OS TESPITI (netexec birincil + nmap fallback)" \
+            "$(grep -iE 'SMB|Windows|signing' "${out}_nxc.txt" 2>/dev/null)
+$(grep -E 'Nmap scan report|OS details|Running:' "${out}_nmap.txt" 2>/dev/null)"
+    else
+        warn "netexec/crackmapexec bulunamadi - nmap -O ile devam ediliyor."
+        warn "  (Oneri: 'pipx install netexec' -> iç ağda cok ise yarar.)"
+        # shellcheck disable=SC2086
+        nmap -O -Pn -n --osscan-guess --max-retries 2 \
+            -iL "$LIVE_HOSTS" -oN "${out}.txt" 2>/dev/null \
+            | grep -E "Nmap scan report|Running|OS details|OS CPE|Aggressive OS"
+        ok "OS tahminleri -> ${out}.txt"
+        log_summary "ADIM 3 - OS TESPITI (nmap -O)" \
+            "$(grep -E 'Nmap scan report|OS details|Running:' "${out}.txt" 2>/dev/null)"
+    fi
+}
+
+# 4) SMB / SMBv1
+# Birincil: netexec/crackmapexec smb -> SMBv1, signing, OS, domain hepsi tek satirda.
+# Ek olarak: nmap NSE (smb-protocols vs) -> nxc yoksa tam kaynak, varsa teyit/detay.
+step_smb() {
+    require_live_hosts || return
+    info "Adim 4: SMB / SMBv1 kontrolu (445/139)..."
+    local out="$OUTDIR/04_smb"
+    local nxc; nxc="$(detect_nxc)"
+
+    if [[ -n "$nxc" ]]; then
+        ok "netexec ($nxc) ile SMB taramasi (signing + SMBv1 tek atista)..."
+        # Duz tarama: her host icin [*] satiri signing:True/False ve SMBv1:True/False verir
+        "$nxc" smb "$LIVE_HOSTS" 2>/dev/null | tee "${out}_nxc.txt" \
+            | grep -iE "SMB|signing|SMBv1"
+
+        # signing:False -> relay'e acik (ic agda cok kritik). Ayikla ve vurgula.
+        local nosign
+        nosign=$(grep -iE "signing:False" "${out}_nxc.txt" 2>/dev/null)
+        if [[ -n "$nosign" ]]; then
+            warn "SMB signing KAPALI host(lar) (NTLM relay'e acik):"
+            echo "$nosign" | sed 's/^/     /'
+        fi
+        # SMBv1:True -> eski/zafiyetli
+        local v1
+        v1=$(grep -iE "SMBv1:True" "${out}_nxc.txt" 2>/dev/null)
+        if [[ -n "$v1" ]]; then
+            warn "SMBv1 ACIK host(lar):"
+            echo "$v1" | sed 's/^/     /'
+        fi
+        ok "netexec SMB sonucu -> ${out}_nxc.txt"
+    else
+        warn "netexec yok - sadece nmap NSE ile SMB taranacak."
+    fi
+
+    # nmap NSE: nxc yoksa ANA kaynak, varsa 139-only host'lar + teyit icin.
+    info "  -> nmap NSE (smb-protocols / security-mode / os-discovery)..."
+    # shellcheck disable=SC2086
+    nmap -Pn -n -p139,445 \
+        --script smb-protocols,smb-security-mode,smb2-security-mode,smb2-capabilities,smb-os-discovery \
+        -iL "$LIVE_HOSTS" -oN "${out}_nmap.txt" 2>/dev/null \
+        | grep -E "Nmap scan report|SMBv1|2\.0|2\.1|message_signing|disabled|required|computer name|Domain" -i
+
+    local smbv1
+    smbv1=$(awk '/Nmap scan report/{ip=$NF} /SMBv1/{print ip" -> SMBv1 ACIK!"}' "${out}_nmap.txt" 2>/dev/null)
+    [[ -n "$smbv1" ]] && { warn "nmap da SMBv1 gordu:"; echo "$smbv1" | sed 's/^/     /'; }
+
+    ok "nmap SMB sonucu -> ${out}_nmap.txt"
+    log_summary "ADIM 4 - SMB / SMBv1" \
+        "$(grep -iE 'SMB|signing|SMBv1' "${out}_nxc.txt" 2>/dev/null)
+$(grep -E 'Nmap scan report|SMBv1|message_signing|computer name|Domain name' -i "${out}_nmap.txt" 2>/dev/null)"
+}
+
+# 5) SMB share / CIFS - anonim erisim
+step_shares() {
+    require_live_hosts || return
+    info "Adim 5: SMB share / CIFS - anonim erisilebilir paylasimlar..."
+    local out="$OUTDIR/05_shares"
+    # smb-enum-shares: paylasimlari listele (anonim/null session ile denenir)
+    # smb-enum-users: kullanici listesi (izin verirse)
+    # shellcheck disable=SC2086
+    nmap -Pn -n -p445 \
+        --script smb-enum-shares,smb-enum-users \
+        -iL "$LIVE_HOSTS" -oN "${out}.txt" 2>/dev/null \
+        | grep -E "Nmap scan report|\\\\\\\\|Anonymous|READ|WRITE|share|Type:|smb-enum" -i
+
+    ok "Share sonucu -> ${out}.txt"
+    warn "READ/WRITE yetkili ya da Anonymous erisilebilir paylasimlara dikkat et."
+    log_summary "ADIM 5 - SMB SHARE / CIFS" \
+        "$(grep -E 'Nmap scan report|Anonymous|READ|WRITE|\\\\|Type:' -i "${out}.txt" 2>/dev/null)"
+}
+
+# 6) SNMP
+step_snmp() {
+    require_live_hosts || return
+    info "Adim 6: SNMP (161/udp) - community string kontrolu..."
+    local out="$OUTDIR/06_snmp"
+    # UDP tarama + snmp-brute (public/private vs varsayilanlar) + snmp-info
+    # shellcheck disable=SC2086
+    nmap -sU -Pn -n -p161 \
+        --script snmp-brute,snmp-info,snmp-sysdescr \
+        -iL "$LIVE_HOSTS" -oN "${out}.txt" 2>/dev/null \
+        | grep -E "Nmap scan report|snmp|community|public|private|sysdescr|open" -i
+
+    local comm
+    comm=$(grep -iE "valid credentials|community" "${out}.txt" 2>/dev/null)
+    if [[ -n "$comm" ]]; then
+        warn "SNMP community bulgusu:"
+        echo "$comm" | sed 's/^/     /'
+    fi
+
+    ok "SNMP sonucu -> ${out}.txt"
+    log_summary "ADIM 6 - SNMP" \
+        "$(grep -E 'Nmap scan report|snmp-brute|community|sysdescr' -i "${out}.txt" 2>/dev/null)"
+}
+
+# 7) Telnet / clear-text servisler
+step_cleartext() {
+    require_live_hosts || return
+    info "Adim 7: Telnet / clear-text servisler (telnet, ftp, rlogin, vnc, http-auth)..."
+    local out="$OUTDIR/07_cleartext"
+    # Sifrelenmemis / zayif kimlik dogrulamali servisler
+    # shellcheck disable=SC2086
+    nmap -sS -sV -Pn -n -p21,23,69,512,513,514,5900,5901,8080,80,8443 \
+        --script telnet-encryption,ftp-anon,rlogin-brute,vnc-info,http-auth \
+        --open -iL "$LIVE_HOSTS" -oN "${out}.txt" 2>/dev/null \
+        | grep -E "Nmap scan report|telnet|ftp|anonymous|rlogin|vnc|open|http-auth|FTP|Anon" -i
+
+    ok "Clear-text sonucu -> ${out}.txt"
+    warn "Acik telnet/ftp-anon/rlogin ic agda yuksek riskli - raporda vurgula."
+    log_summary "ADIM 7 - TELNET / CLEAR-TEXT" \
+        "$(grep -E 'Nmap scan report|telnet|ftp-anon|Anonymous|rlogin|vnc|/tcp.*open' -i "${out}.txt" 2>/dev/null)"
+}
+
+# 8) Veritabani portlari + surum tespiti
+# Ic agda acik/zayif-parolali DB bulmak kritiktir (MSSQL -> xp_cmdshell RCE,
+# Redis/Mongo/Memcached cogu zaman auth'suz gelir). Sadece -sV + bilgi-sizdiran
+# NSE scriptleri; kimlik dogrulama / brute DENENMEZ.
+step_db() {
+    require_live_hosts || return
+    info "Adim 8: Veritabani portlari + surum tespiti..."
+    local out="$OUTDIR/08_databases"
+
+    # Yaygin DB portlari:
+    #  1433 MSSQL | 1521 Oracle | 3306 MySQL/MariaDB | 5432 PostgreSQL
+    #  27017 Mongo | 6379 Redis | 11211 Memcached | 9200 Elasticsearch
+    #  5984 CouchDB | 9042 Cassandra | 50000 DB2 | 7000-7001 Cassandra-int
+    local db_ports="1433,1521,3306,5432,27017,27018,6379,11211,9200,9300,5984,9042,50000,3050,8086"
+
+    # Bilgi sizdiran (auth'suz) NSE scriptleri - versiyon/config/no-auth tespiti
+    local db_scripts="ms-sql-info,ms-sql-ntlm-info,ms-sql-dac,mysql-info,pgsql-brute,oracle-tns-version,oracle-sid-brute,mongodb-info,mongodb-databases,redis-info,memcached-info,couchdb-stats"
+    # Not: redis-info & mongodb-info & memcached-info auth YOKSA direkt bilgi verir
+    #      (yani DB'nin disariya acik / korumasiz oldugunu kanitlar).
+
+    # shellcheck disable=SC2086
+    nmap -sS -sV -Pn -n -p "$db_ports" --open \
+        --script "$db_scripts" --script-args unsafe=0 \
+        --version-intensity 7 --max-retries 2 \
+        -iL "$LIVE_HOSTS" -oN "${out}.txt" -oG "${out}.gnmap" 2>/dev/null \
+        | grep -E "Nmap scan report|open|mssql|mysql|postgres|oracle|mongo|redis|memcached|elastic|couch|cassandra|version" -i
+
+    # Acik DB'leri IP + port + servis olarak derli toplu cikar
+    local found
+    found=$(awk '/Nmap scan report/{ip=$NF} /\/tcp.*open/{print ip" "$1" "$3" "$4" "$5" "$6}' "${out}.txt" 2>/dev/null)
+    if [[ -n "$found" ]]; then
+        warn "Acik veritabani servis(ler)i bulundu:"
+        echo "$found" | sed 's/^/     /'
+        # Auth'suz erisim kaniti (redis/mongo/memcached bilgi dondurduyse)
+        local noauth
+        noauth=$(grep -iE "redis-info|mongodb-info|memcached-info|# Server|uptime_in_seconds|version:" "${out}.txt" 2>/dev/null)
+        [[ -n "$noauth" ]] && { echo -e "${C_R}"; warn "AUTH'SUZ erisim sinyali (korumasiz DB!):"; echo "$noauth" | sed 's/^/     /'; echo -e "${C_RST}"; }
+    else
+        info "Acik veritabani portu gorunmedi."
+    fi
+
+    ok "Veritabani sonucu -> ${out}.txt"
+    log_summary "ADIM 8 - VERITABANI PORTLARI / SURUMLER" \
+        "$(grep -E 'Nmap scan report|/tcp.*open|redis-info|mongodb-info|version' -i "${out}.txt" 2>/dev/null)"
+}
+
+# 9) Hizli zafiyet NSE (yaygin ic-ag)
+# 9) VMware / ESXi / vCenter tespiti + surum
+# Asama 1 (dusuk FP): aday tespiti -> 3 sinyal (herhangi biri tutarsa aday)
+#   A) 902/tcp acik          -> en guclu (vmware-auth daemon)
+#   B) ssl-cert issuer'inda O=VMware / OU=VMware Engineering -> neredeyse kesin
+#   C) http-title / banner'da VMware|ESXi -> guclu
+#   D) 5480 (VCSA) / 5988 / 5989 acik -> destekleyici
+# Asama 2 (kesin surum): adaylara SOAP RetrieveServiceContent (kullanicinin komutu)
+#   -> once adayin acik HTTPS portu (443, yoksa 5480) denenir. Exploit YOK.
+step_vmware() {
+    require_live_hosts || return
+    info "Adim 9: VMware / ESXi / vCenter tespiti + surum..."
+    local out="$OUTDIR/09_vmware"
+    local cand="$OUTDIR/.vmware_adaylari.txt"
+    : > "$cand"
+
+    # curl yoksa Asama 2 (SOAP) calismaz -> uyar ama Asama 1 yine calissin
+    local have_curl=1
+    command -v curl >/dev/null 2>&1 || { have_curl=0; warn "curl yok - sadece aday tespiti yapilacak, SOAP surum atlanacak."; }
+
+    # --- Asama 1: aday tespiti (port + sertifika + http) ---
+    info "  -> Asama 1: VMware adaylari (port 443/902/903/5480/5988/5989 + ssl-cert + http-title)..."
+    # shellcheck disable=SC2086
+    nmap -sS -Pn -n -p443,902,903,5480,5988,5989 --open \
+        --script ssl-cert,http-title \
+        -iL "$LIVE_HOSTS" -oN "${out}_tarama.txt" -oG "${out}.gnmap" 2>/dev/null \
+        | grep -E "Nmap scan report|902/tcp|5480/tcp|598[89]/tcp|VMware|ESXi|Subject:|Issuer:|http-title|vmware-auth" -i
+
+    # Aday kriterleri: her host blogunda sinyal A/B/C/D'den biri tutuyorsa IP yaz
+    awk '
+        /Nmap scan report/              { if(ip && vm) print ip; ip=$NF; vm=0 }
+        /902\/tcp +open/                { vm=1 }                         # A: vmware-auth
+        /vmware-auth/                   { vm=1 }                         # A: banner
+        /(O|OU)=VMware/                 { vm=1 }                         # B: sertifika issuer/subject
+        /VMware Engineering/            { vm=1 }                         # B
+        /(http-title|Issuer|Subject|commonName).*(VMware|ESXi)/ { vm=1 } # C: http/cert icerik
+        /VMware ESXi Server httpd/      { vm=1 }                         # C: servis banner
+        /5480\/tcp +open/               { vm=1 }                         # D: VCSA
+        /598[89]\/tcp +open/            { vm=1 }                         # D: CIM
+        END { if(ip && vm) print ip }
+    ' "${out}_tarama.txt" | sort -V -u > "$cand"
+
+    local cc; cc=$(wc -l < "$cand" 2>/dev/null || echo 0)
+    if [[ "$cc" -eq 0 ]]; then
+        info "  VMware adayi bulunamadi."
+        ok "VMware tarama ciktisi -> ${out}_tarama.txt"
+        log_summary "ADIM 9 - VMWARE (aday bulunamadi)" ""
+        rm -f "$cand"
+        return
+    fi
+    warn "$cc VMware adayi bulundu:"
+    sed 's/^/     /' "$cand"
+
+    # --- Asama 2: adaylara SOAP RetrieveServiceContent (kesin surum) ---
+    if [[ $have_curl -eq 1 ]]; then
+        info "  -> Asama 2: adaylara SOAP RetrieveServiceContent (kesin surum)..."
+        : > "${out}_surumler.txt"
+        while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            echo -e "\n[$ip] VMware surum tespiti:" | tee -a "${out}_surumler.txt"
+
+            # Adayin acik HTTPS portunu sec: once 443, yoksa 5480
+            # (gnmap'ten o IP'nin acik portlarina bak)
+            local sport=""
+            if grep -qE "Host: $ip .*443/open" "${out}.gnmap" 2>/dev/null; then
+                sport=443
+            elif grep -qE "Host: $ip .*5480/open" "${out}.gnmap" 2>/dev/null; then
+                sport=5480
+            else
+                sport=443   # emin olamadiysak varsayilan 443
+            fi
+
+            local resp
+            resp=$(curl -sk --max-time 10 -X POST "https://$ip:$sport/sdk" \
+                -H "Content-Type: text/xml" \
+                -d '<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><RetrieveServiceContent xmlns="urn:vim25"><_this type="ServiceInstance">ServiceInstance</_this></RetrieveServiceContent></soap:Body></soap:Envelope>' 2>/dev/null)
+
+            local found=0 fld val
+            for fld in fullName version build apiType apiVersion osType productLineId instanceUuid; do
+                val=$(echo "$resp" | grep -oP "(?<=<$fld>)[^<]+" | head -1)
+                if [[ -n "$val" ]]; then
+                    printf "    %-14s: %s\n" "$fld" "$val" | tee -a "${out}_surumler.txt"
+                    found=1
+                fi
+            done
+            if [[ $found -eq 0 ]]; then
+                warn "    [$ip:$sport] SOAP cevabi alinamadi (SDK kapali / farkli port olabilir)."
+                echo "    (SOAP cevabi yok - port $sport)" >> "${out}_surumler.txt"
+            fi
+        done < "$cand"
+        ok "VMware surum sonucu -> ${out}_surumler.txt"
+    fi
+
+    ok "VMware tarama ciktisi -> ${out}_tarama.txt"
+    log_summary "ADIM 9 - VMWARE / ESXi / vCenter ($cc aday)" \
+        "ADAYLAR:
+$(cat "$cand" 2>/dev/null)
+
+SURUMLER:
+$(cat "${out}_surumler.txt" 2>/dev/null)"
+    rm -f "$cand"
+}
+
+# 10) Hizli zafiyet NSE (yaygin ic-ag)
+step_vuln() {
+    require_live_hosts || return
+    info "Adim 10: Hizli zafiyet NSE (ms17-010 / smb-vuln* vs)..."
+    warn "Bu adim exploit DENEMEZ, sadece zafiyet var mi diye KONTROL eder (safe)."
+    local out="$OUTDIR/10_vuln_nse"
+    # ms17-010 (EternalBlue), smb-vuln-* yaygin ic ag zafiyetleri
+    # shellcheck disable=SC2086
+    nmap -Pn -n -p139,445,3389 \
+        --script "smb-vuln-ms17-010,smb-vuln-ms08-067,smb-vuln-cve2009-3103,rdp-vuln-ms12-020" \
+        --script-args unsafe=0 \
+        -iL "$LIVE_HOSTS" -oN "${out}.txt" 2>/dev/null \
+        | grep -E "Nmap scan report|VULNERABLE|ms17-010|ms08-067|CVE|State:|LIKELY" -i
+
+    local vuln
+    vuln=$(grep -iE "VULNERABLE|State: VULNERABLE" "${out}.txt" 2>/dev/null)
+    if [[ -n "$vuln" ]]; then
+        echo -e "${C_R}"
+        warn "ZAFIYETLI HOST(LAR) BULUNDU:"
+        echo "$vuln" | sed 's/^/     /'
+        echo -e "${C_RST}"
+    fi
+
+    ok "Zafiyet NSE sonucu -> ${out}.txt"
+    log_summary "ADIM 10 - HIZLI ZAFIYET NSE" \
+        "$(grep -E 'Nmap scan report|VULNERABLE|ms17-010|State:' -i "${out}.txt" 2>/dev/null)"
+}
+
+# ----------------------- AUTO mod -----------------------
+run_auto() {
+    info "OTOMATIK MOD - tum adimlar sirayla calisacak.\n"
+    step_discovery
+    if [[ ! -s "$LIVE_HOSTS" ]]; then
+        warn "Canli host yok, diger adimlar atlaniyor."
+        finish
+        return
+    fi
+    step_ports
+    step_os
+    step_smb
+    step_shares
+    step_snmp
+    step_cleartext
+    step_db
+    step_vmware
+    step_vuln
+    finish
+}
+
+# ----------------------- Interaktif menu -----------------------
+interactive_menu() {
+    while true; do
+        local lc; lc=$(wc -l < "$LIVE_HOSTS" 2>/dev/null || echo 0)
+        echo ""
+        echo -e "${C_C}=============== ICTARA MENU ===============${C_RST}"
+        echo -e "  Hedef   : ${C_Y}${TARGET:-$TARGET_LIST}${C_RST}"
+        echo -e "  Canli   : ${C_G}${lc}${C_RST} host   Cikti: ${C_DIM}${OUTDIR}${C_RST}"
+        echo -e "${C_C}------------------------------------------${C_RST}"
+        echo "  1) Host discovery (canli IP'leri bul)"
+        echo "  2) Port + servis tarama"
+        echo "  3) OS tespiti"
+        echo "  4) SMB / SMBv1 kontrolu"
+        echo "  5) SMB share / CIFS (anonim paylasim)"
+        echo "  6) SNMP community kontrolu"
+        echo "  7) Telnet / clear-text servisler"
+        echo "  8) Veritabani portlari + surum tespiti"
+        echo "  9) VMware / ESXi / vCenter tespiti + surum"
+        echo " 10) Hizli zafiyet NSE (ms17-010 vs)"
+        echo -e "${C_C}------------------------------------------${C_RST}"
+        echo "  A) HEPSINI sirayla calistir (auto)"
+        echo "  R) Ozet raporu goster"
+        echo "  Q) Cik"
+        echo -e "${C_C}==========================================${C_RST}"
+        read -rp "  Secim > " choice
+        echo ""
+        case "${choice,,}" in
+            1) step_discovery ;;
+            2) step_ports ;;
+            3) step_os ;;
+            4) step_smb ;;
+            5) step_shares ;;
+            6) step_snmp ;;
+            7) step_cleartext ;;
+            8) step_db ;;
+            9) step_vmware ;;
+            10) step_vuln ;;
+            a) run_auto ;;
+            r) [[ -s "$SUMMARY" ]] && less "$SUMMARY" || warn "Henuz rapor yok." ;;
+            q) finish; exit 0 ;;
+            *) warn "Gecersiz secim." ;;
+        esac
+    done
+}
+
+# ----------------------- Bitis -----------------------
+finish() {
+    echo ""
+    ok "Bitti. Tum ciktilar: ${C_Y}${OUTDIR}/${C_RST}"
+    ok "Ozet rapor         : ${C_Y}${SUMMARY}${C_RST}"
+    echo -e "${C_DIM}  (ayrica her adimin ham nmap ciktisi 0X_*.txt dosyalarinda)${C_RST}"
+}
+
+# ----------------------- Arg parse -----------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--target)    TARGET="$2"; shift 2 ;;
+            -l|--list)      TARGET_LIST="$2"; shift 2 ;;
+            --auto)         AUTO=1; shift ;;
+            --ping)         PING_SCAN=1; shift ;;
+            --top-ports)    TOP_PORTS="--top-ports $2"; shift 2 ;;
+            --full-ports)   TOP_PORTS="-p-"; shift ;;
+            -o|--output)    OUTDIR="$2"; shift 2 ;;
+            -h|--help)      usage; exit 0 ;;
+            *)              die "Bilinmeyen secenek: $1  ('--help' ile bak)" ;;
+        esac
+    done
+}
+
+# ----------------------- Main -----------------------
+main() {
+    parse_args "$@"
+    banner
+    need_root
+    check_deps
+
+    # Hedef yoksa interaktif olarak sor
+    if [[ -z "$TARGET" && -z "$TARGET_LIST" ]]; then
+        read -rp "  Hedef subnet/IP (orn 10.0.0.0/24) > " TARGET
+        [[ -z "$TARGET" ]] && die "Hedef girilmedi."
+    fi
+
+    # Hedef dosyasi verildiyse var mi kontrol
+    if [[ -n "$TARGET_LIST" && ! -s "$TARGET_LIST" ]]; then
+        die "Hedef dosyasi bulunamadi veya bos: $TARGET_LIST"
+    fi
+
+    # Cikti dizini
+    [[ -z "$OUTDIR" ]] && OUTDIR="ictara_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$OUTDIR" || die "Cikti dizini olusturulamadi: $OUTDIR"
+    LIVE_HOSTS="$OUTDIR/canli_hostlar.txt"
+    SUMMARY="$OUTDIR/OZET_RAPOR.txt"
+    : > "$LIVE_HOSTS"
+    {
+        echo "ICTARA - Ic Ag Tarama Ozet Raporu"
+        echo "Tarih   : $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Hedef   : ${TARGET:-$TARGET_LIST}"
+        echo "Mod     : $([[ $AUTO -eq 1 ]] && echo OTOMATIK || echo INTERAKTIF)"
+    } > "$SUMMARY"
+
+    ok "Cikti dizini: $OUTDIR"
+
+    if [[ $AUTO -eq 1 ]]; then
+        run_auto
+    else
+        interactive_menu
+    fi
+}
+
+main "$@"
